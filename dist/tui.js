@@ -232,12 +232,11 @@ export default Plugin.define({
     function sectionColor(id) {
       return color(config()?.sections?.[id]?.color ?? "base");
     }
-    const [open, setOpen] = createSignal({
-      mcpCost: true,
-      clocks: true,
-      calendar: true,
-      plugins: false
-    });
+
+    // Configurable via cli.json/opencode.json plugin options; every section starts
+    // collapsed unless explicitly expanded with { "collapsedByDefault": false }.
+    const collapsedByDefault = context.options?.collapsedByDefault !== false;
+    const [open, setOpen] = createSignal(Object.fromEntries(SECTIONS.map(id => [id, !collapsedByDefault])));
     function header(id, title) {
       const ctx = usePlugin();
       return (() => {
