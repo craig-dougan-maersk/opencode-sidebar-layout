@@ -120,6 +120,24 @@ test("header retains one supported onMouseDown without duplicate onClick", async
   assert.ok(!attributes.includes("onClick"));
 });
 
+test("every section starts collapsed unless the option opts out", async () => {
+  const compiled = await readFile("dist/tui.js", "utf8");
+  // Default is collapsed: the option only expands when explicitly set to false.
+  assert.match(
+    compiled,
+    /context\.options\?\.collapsedByDefault\s*!==\s*false/,
+    "the collapsed default must be driven by the plugin option",
+  );
+  // No section may keep the old hard-coded expanded default.
+  assert.doesNotMatch(
+    compiled,
+    /mcpCost:\s*true/,
+    "sections must not default to expanded",
+  );
+  const source = await readFile("src/tui.tsx", "utf8");
+  assert.match(source, /Object\.fromEntries\(SECTIONS\.map/);
+});
+
 test("root graph alone resolves patched Seroval", async () => {
   const manifest = JSON.parse(await readFile("package.json", "utf8"));
   const lock = JSON.parse(await readFile("package-lock.json", "utf8"));

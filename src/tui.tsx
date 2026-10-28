@@ -175,12 +175,12 @@ export default Plugin.define({
       return color(config()?.sections?.[id]?.color ?? "base");
     }
 
-    const [open, setOpen] = createSignal<Record<string, boolean>>({
-      mcpCost: true,
-      clocks: true,
-      calendar: true,
-      plugins: false,
-    });
+    // Configurable via cli.json/opencode.json plugin options; every section starts
+    // collapsed unless explicitly expanded with { "collapsedByDefault": false }.
+    const collapsedByDefault = context.options?.collapsedByDefault !== false;
+    const [open, setOpen] = createSignal<Record<string, boolean>>(
+      Object.fromEntries(SECTIONS.map((id) => [id, !collapsedByDefault])),
+    );
 
     function header(id: SectionID, title: string) {
       const ctx = usePlugin();

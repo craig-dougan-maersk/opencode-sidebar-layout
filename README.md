@@ -5,6 +5,27 @@ The `./tui` export loads committed JavaScript from `dist/tui.js`, not raw TSX.
 The Solid universal compiler targets `@opentui/solid`; host runtime imports
 remain external. No React dependency or bundled renderer is introduced.
 
+## Collapsed by default
+
+Every section starts collapsed, so the sidebar stays quiet until you open the
+part you need. Click a section header to expand or collapse it.
+
+Set `collapsedByDefault` to `false` in the plugin options to start with every
+section expanded instead:
+
+```jsonc title="cli.json"
+{
+  "plugins": [
+    {
+      "package": "craig-dougan-maersk/opencode-sidebar-layout",
+      "options": { "collapsedByDefault": true }
+    }
+  ]
+}
+```
+
+Absent or `true` keeps the collapsed default.
+
 ## Development
 
 Use Node.js 26 and npm. From the repository root:
