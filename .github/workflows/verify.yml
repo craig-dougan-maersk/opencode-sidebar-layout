@@ -1,0 +1,27 @@
+name: Verify package
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '26'
+        cache: npm
+    - run: npm ci --ignore-scripts
+    - run: npm audit --audit-level=critical
+    - run: npm run typecheck
+      # Check before rebuilding so stale or missing committed output fails.
+    - run: npm run build:check
+    - run: npm run test:coverage
+    - run: npm run compile
+    - run: git diff --exit-code -- dist/tui.js
+    - run: node --check dist/tui.js
