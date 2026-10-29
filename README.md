@@ -34,7 +34,8 @@ registered them, so each keeps its own heading, collapsible state and settings.
 The layout never draws a second heading by default: every known sidebar plugin
 already renders its own, and defaulting to no heading also keeps the behaviour
 safe for third-party plugins the layout has never seen. A section that wants a
-layout-managed heading opts in with `header: true`.
+layout-managed heading opts in with `header: true`. Every section is separated
+from the previous one by a single blank line.
 
 ## Host sections versus third-party sections
 
