@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseSync } from "@babel/core";
 import test from "node:test";
@@ -120,7 +120,7 @@ test("header retains one supported onMouseDown without duplicate onClick", async
   assert.ok(!attributes.includes("onClick"));
 });
 
-test("every section starts collapsed unless the option opts out", async () => {
+test("sidebar sections are adopted from sibling plugins and default to collapsed", async () => {
   const compiled = await readFile("dist/tui.js", "utf8");
   // Default is collapsed: the option only expands when explicitly set to false.
   assert.match(
@@ -128,6 +128,9 @@ test("every section starts collapsed unless the option opts out", async () => {
     /context\.options\?\.collapsedByDefault\s*!==\s*false/,
     "the collapsed default must be driven by the plugin option",
   );
+  // Adoption reads the host's resolved slot graph and re-renders what it displaced.
+  assert.match(compiled, /slots\.resolved\(\)/);
+  assert.match(compiled, /suppressed/);
   // No section may keep the old hard-coded expanded default.
   assert.doesNotMatch(
     compiled,
@@ -135,7 +138,74 @@ test("every section starts collapsed unless the option opts out", async () => {
     "sections must not default to expanded",
   );
   const source = await readFile("src/tui.tsx", "utf8");
-  assert.match(source, /Object\.fromEntries\(SECTIONS\.map/);
+  // Two-phase claim: probe with prepend, then replace once the host is found.
+  assert.match(source, /prepend:\s*SIDEBAR_SLOT/);
+  assert.match(source, /replace:\s*SIDEBAR_SLOT/);
+  // `mode: "coexist"` disables adoption entirely.
+  assert.match(source, /mode\s*!==\s*"coexist"/);
+  // Host built-ins pass through unless explicitly adopted.
+  assert.match(source, /isManaged\s*=\s*\(id: string\)/);
+  // The re-implemented sections and their hard-coded ids are gone.
+  assert.doesNotMatch(source, /SECTIONS/);
+  assert.doesNotMatch(source, /mcpCost/);
+});
+
+test("setup claims the sidebar in adopt mode and stays inert in coexist mode", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "sidebar-layout-setup-"));
+  try {
+    await mkdir(join(directory, ".config", "opencode"), { recursive: true });
+    const probe = `
+      const fs = require("node:fs");
+      const path = require("node:path");
+      (async () => {
+        process.env.HOME = process.argv[1];
+        const { default: plugin } = await import(process.argv[2]);
+        const calls = [];
+        const context = {
+          options: { collapsedByDefault: true },
+          location: {},
+          theme: { text: { base: "base", error: "error" } },
+          ui: { slot: (claim) => { calls.push(claim); return () => {}; } },
+          keymap: { layer: () => {}, commands: () => [], dispatch: () => {} },
+          client: { plugin: { list: async () => [] } },
+          data: { location: { default: () => ({}) } },
+        };
+        const dispose = await plugin.setup(context);
+        const adopt = {
+          count: calls.length,
+          keys: Object.keys(calls[0] || {}).sort(),
+          render: typeof (calls[0] || {}).render,
+          dispose: typeof dispose,
+        };
+        calls.length = 0;
+        fs.writeFileSync(
+          path.join(process.argv[1], ".config", "opencode", "sidebar-layout.json"),
+          JSON.stringify({ mode: "coexist" }),
+        );
+        await plugin.setup(context);
+        process.stdout.write(
+          JSON.stringify({ id: plugin.id, adopt, coexist: calls.length }),
+        );
+      })().catch((error) => {
+        process.stderr.write(String((error && error.stack) || error));
+        process.exit(1);
+      });
+    `;
+    const output = execFileSync(
+      process.execPath,
+      ["--conditions=browser", "-e", probe, directory, resolve("dist/tui.js")],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    );
+    const result = JSON.parse(output);
+    assert.equal(result.id, "sidebar.layout");
+    assert.equal(result.adopt.count, 1);
+    assert.deepEqual(result.adopt.keys, ["prepend", "render"]);
+    assert.equal(result.adopt.render, "function");
+    assert.equal(result.adopt.dispose, "function");
+    assert.equal(result.coexist, 0);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("root graph alone resolves patched Seroval", async () => {
