@@ -162,6 +162,83 @@ export function moveWithin(
   return undefined;
 }
 
+export interface DragState {
+  source?: string;
+  target?: { id: string; after: boolean };
+}
+
+export interface DragEvent {
+  type: string;
+  id: string;
+  button?: number;
+  ctrl?: boolean;
+  /** The press landed on content that cannot start a text selection. */
+  plain?: boolean;
+  pointerY?: number;
+  top?: number;
+  height?: number;
+}
+
+export interface DragMove {
+  id: string;
+  targetId: string;
+  after: boolean;
+}
+
+// Pure drag state machine for section reordering.
+//
+// A press arms the drag when it is either ctrl + left (ctrl is the only
+// modifier the renderer excludes from its text-selection path) or a plain left
+// press on non-selectable content. `over` records the section under the pointer
+// and whether the release lands after its midpoint; moving back over the source
+// clears that target again. The release itself commits the move, because the
+// renderer dispatches `drag-end` and `up` to the source renderable where the
+// drag was captured, and only then dispatches `drop` to the target. Committing
+// on `up` therefore works even if the `drop` never arrives, and `drop` stays as
+// a fallback. The caller clears only after the release has been handled.
+export function dragReduce(
+  state: DragState,
+  event: DragEvent,
+): { state: DragState; move?: DragMove } {
+  const commit = (): { state: DragState; move?: DragMove } => {
+    const target = state.target;
+    if (state.source && target && target.id !== state.source) {
+      return {
+        state: { source: state.source },
+        move: {
+          id: state.source,
+          targetId: target.id,
+          after: target.after,
+        },
+      };
+    }
+    return { state };
+  };
+  switch (event.type) {
+    case "down":
+      if (event.button === 0 && (event.ctrl || event.plain)) {
+        return { state: { source: event.id } };
+      }
+      return { state: {} };
+    case "over": {
+      if (!state.source) return { state };
+      if (state.source === event.id) return { state: { source: state.source } };
+      const top = event.top ?? 0;
+      const height = event.height ?? 0;
+      const after = (event.pointerY ?? top) > top + height / 2;
+      return {
+        state: { source: state.source, target: { id: event.id, after } },
+      };
+    }
+    case "up":
+    case "drop":
+      return commit();
+    case "drag-end":
+    default:
+      return { state };
+  }
+}
+
 export default Plugin.define({
   id: PLUGIN_ID,
   async setup(context: any) {
@@ -342,58 +419,78 @@ export default Plugin.define({
       );
 
       // Drag reordering. Ctrl is the only modifier the renderer excludes from
-      // its text-selection path, so ctrl + left-drag reorders instead of
-      // selecting the section content under the pointer. Drag events reach the
+      // its text-selection path, so ctrl + left-drag always reorders; a plain
+      // left press on non-selectable content reorders too. Drag events reach the
       // pressed renderable and bubble up to its section wrapper; `over` reaches
       // the wrapper under the pointer; `drop` reaches the wrapper it lands on.
-      const [dragId, setDragId] = createSignal<string | undefined>();
-      const [dropTarget, setDropTarget] = createSignal<
-        { id: string; after: boolean } | undefined
-      >();
+      const [drag, setDrag] = createSignal<DragState>({});
       const dragEnabled = () => config()?.dragReorder !== false;
+
+      // The heading of a headed section doubles as a drag handle: it is not
+      // selectable, so a plain press arms a reorder instead of a text selection.
+      // A release in place (no drop target) still toggles collapse.
+      let headingClick: string | undefined;
 
       const onSectionMouse = (id: string, e: any) => {
         if (!dragEnabled()) return;
         const type = e?.type;
         if (type === "down") {
-          if (e?.button === 0 && e?.modifiers?.ctrl) {
-            setDragId(id);
-            setDropTarget(undefined);
-          }
+          const target = e?.target;
+          setDrag(
+            dragReduce(drag(), {
+              type: "down",
+              id,
+              button: e?.button,
+              ctrl: Boolean(e?.modifiers?.ctrl),
+              plain: Boolean(target && target.selectable === false),
+            }).state,
+          );
           return;
         }
         if (type === "over") {
-          const active = dragId();
-          if (!active || active === id) return;
           const rect = e?.currentTarget;
-          const top = rect?.screenY ?? rect?.y ?? 0;
-          const height = rect?.height ?? 0;
-          const after = Number(e?.y ?? top) > top + height / 2;
-          setDropTarget({ id, after });
+          setDrag(
+            dragReduce(drag(), {
+              type: "over",
+              id,
+              pointerY: Number(e?.y ?? 0),
+              top: rect?.screenY ?? rect?.y ?? 0,
+              height: rect?.height ?? 0,
+            }).state,
+          );
           return;
         }
         if (type === "drop") {
-          const active = dragId();
-          const target = dropTarget();
-          if (active && target && target.id !== active) {
-            moveTo(active, target.id, target.after);
+          const result = dragReduce(drag(), { type: "drop", id });
+          if (result.move) {
+            moveTo(result.move.id, result.move.targetId, result.move.after);
           }
-          setDropTarget(undefined);
+          setDrag({});
           return;
         }
-        if (type === "up" || type === "drag-end") {
-          setDragId(undefined);
-          setDropTarget(undefined);
+        if (type === "up") {
+          // Commit on release: the renderer sends `up` to the source where the
+          // drag was captured, so this works even when no `drop` follows.
+          const result = dragReduce(drag(), { type: "up", id });
+          if (result.move) {
+            moveTo(result.move.id, result.move.targetId, result.move.after);
+          }
+          setDrag({});
+          return;
+        }
+        if (type === "drag-end") {
+          // `up` follows immediately and carries the commit.
+          return;
         }
       };
 
       const dragStatus = () => {
-        const active = dragId();
-        if (!active) return "";
-        const target = dropTarget();
+        const current = drag();
+        if (!current.source) return "";
+        const target = current.target;
         if (!target)
-          return `Moving ${labelFor(active)} · release over a section`;
-        return `Moving ${labelFor(active)} · ${target.after ? "after" : "before"} ${labelFor(target.id)}`;
+          return `Moving ${labelFor(current.source)} · release over a section`;
+        return `Moving ${labelFor(current.source)} · ${target.after ? "after" : "before"} ${labelFor(target.id)}`;
       };
 
       const claimView = (claim: any, id: string) => (
@@ -418,18 +515,29 @@ export default Plugin.define({
                 >
                   <box
                     onMouseDown={(e: any) => {
-                      // Ctrl + drag reorders the section rather than collapsing
-                      // it, so the heading never toggles on a ctrl press.
-                      if (e?.modifiers?.ctrl) return;
+                      // Arm the reorder from the heading, then stop the event so
+                      // the section wrapper does not arm it a second time.
                       try {
                         e?.stopPropagation?.();
                       } catch {}
+                      onSectionMouse(group.id, e);
+                      if (!e?.modifiers?.ctrl) headingClick = group.id;
+                    }}
+                    onMouseUp={(e: any) => {
+                      // A drag that leaves the heading reorders the section;
+                      // only a release in place toggles collapse. Ctrl presses
+                      // never toggle.
+                      if (e?.modifiers?.ctrl) return;
+                      if (headingClick !== group.id) return;
+                      headingClick = undefined;
+                      if (drag().target) return;
                       setSection(group.id, {
                         collapsed: !isCollapsed(group.id),
                       });
                     }}
                   >
                     <text
+                      selectable={false}
                       fg={color(colorName(group.id))}
                       attributes={TextAttributes.BOLD}
                     >

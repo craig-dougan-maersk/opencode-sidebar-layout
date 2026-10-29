@@ -59,7 +59,8 @@ Settings live in `~/.config/opencode/sidebar-layout.json` and are edited with th
   "includeBuiltin": false,
   // New sections start collapsed unless a section overrides it.
   "collapseByDefault": true,
-  // Ctrl + drag a section up or down to reorder it (default: true).
+  // Drag a section by its heading, or Ctrl + drag anywhere, to reorder it
+  // (default: true).
   "dragReorder": true,
   // Keyed by the plugin id that registered the section.
   "sections": {
@@ -90,7 +91,7 @@ Settings live in `~/.config/opencode/sidebar-layout.json` and are edited with th
 - `collapsed` — per-section override of `collapseByDefault` for headed sections.
 - `color` — one of `base`, `muted`, `success`, `warning`, `error`, `info`.
 - `title` — heading text; defaults to a friendly name derived from the plugin id.
-- `dragReorder` — set `false` to disable ctrl + drag reordering of sections.
+- `dragReorder` — set `false` to disable click-and-drag reordering of sections.
 
 ## Reordering
 
@@ -102,11 +103,15 @@ Two ways to reorder sections, beyond setting `order` by hand:
   are also bound to `alt+up` and `alt+down` as dialog footer actions, which the
   host triggers without closing the dialog. `Escape` returns to the section
   list; a second `Escape` at the list closes the command.
-- Hold `Ctrl` and drag a section up or down. A status line above the sidebar
-  shows where the section will land. `Ctrl` is required: the renderer starts a
-  text selection on a plain or `Alt` drag over the plugins' selectable text, and
-  `Ctrl` is the only modifier it excludes from that path. Set `dragReorder` to
-  `false` to turn dragging off.
+- Drag a section up or down and release over another section. A status line
+  above the sidebar shows where the section will land. In a headed section the
+  heading itself is the drag handle — press it and drag; a click that does not
+  move still collapses or expands the section. `Ctrl` + drag reorders from
+  anywhere in a section, which is the reliable option when a plain drag would
+  otherwise start a text selection over a plugin's selectable content. `Ctrl` is
+  the only modifier the renderer excludes from that text-selection path, so
+  `Ctrl` + drag always reorders. Set `dragReorder` to `false` to turn dragging
+  off.
 
 Both write the same explicit per-section `order` index used by the `order`
 setting.
