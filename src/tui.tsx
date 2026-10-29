@@ -1,98 +1,154 @@
 import { Plugin, usePlugin } from "@opencode/plugin/tui";
-import { createSignal, createResource, For, Show } from "solid-js";
+import {
+  createEffect,
+  createMemo,
+  createResource,
+  createSignal,
+  ErrorBoundary,
+  For,
+  getOwner,
+  onMount,
+  Show,
+} from "solid-js";
 import { TextAttributes } from "@opentui/core";
 
-const ZONES = [
-  { id: "UTC", city: "UTC", code: "UTC" },
-  { id: "America/New_York", city: "New York", code: "ET" },
-  { id: "America/Chicago", city: "Chicago", code: "CT" },
-  { id: "America/Denver", city: "Denver", code: "MT" },
-  { id: "America/Los_Angeles", city: "Los Angeles", code: "PT" },
-  { id: "Europe/London", city: "London", code: "GMT" },
-  { id: "Europe/Paris", city: "Paris", code: "CET" },
-  { id: "Europe/Berlin", city: "Berlin", code: "CET" },
-  { id: "Asia/Kolkata", city: "Kolkata", code: "IST" },
-  { id: "Asia/Tokyo", city: "Tokyo", code: "JST" },
-  { id: "Asia/Shanghai", city: "Shanghai", code: "CST" },
-  { id: "Australia/Sydney", city: "Sydney", code: "AEST" },
-  { id: "Pacific/Auckland", city: "Auckland", code: "NZST" },
-];
-
-const SECTIONS = ["mcpCost", "clocks", "calendar", "plugins"] as const;
-type SectionID = (typeof SECTIONS)[number];
-
+const SIDEBAR_SLOT = "sidebar.content";
+const PLUGIN_ID = "sidebar.layout";
 const COLORS = ["base", "muted", "success", "warning", "error", "info"];
+const BUILTIN = /^opencode[./]/;
+const ACRONYMS: Record<string, string> = {
+  mcp: "MCP",
+  ai: "AI",
+  lsp: "LSP",
+  vcs: "VCS",
+  cli: "CLI",
+  url: "URL",
+};
+// Friendly headings used when a section opts into a layout-drawn heading.
+const KNOWN_TITLES: Record<string, string> = {
+  "timezone.clocks": "Clocks",
+  "plugins.pane": "Plugins",
+  "mcp.manager": "MCP",
+  "streetturtle.recap": "Recap",
+  "streetturtle.context-progress": "Context",
+};
 
-function zoneInfo(id: string) {
-  return ZONES.find((z) => z.id === id) || { id, city: id, code: id };
+interface SectionConfig {
+  order?: number;
+  visible?: boolean;
+  header?: boolean;
+  collapsed?: boolean;
+  color?: string;
+  title?: string;
 }
 
-function formatTime(tz: string, now: number) {
+// The host keeps every plugin's slot claims in a Solid context that it provides
+// around the whole TUI tree. A plugin cannot reach another plugin's registered
+// render through the public slot API, but its own render is mounted inside that
+// tree, so the host context is reachable by walking the Solid owner chain and
+// looking for the object that exposes `slots.resolved` and `registered`.
+function hostFromOwner(): any {
+  let owner: any;
   try {
-    return new Intl.DateTimeFormat("en-GB", {
-      timeZone: tz,
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-      hour12: false,
-    }).format(now);
+    owner = getOwner();
   } catch {
-    return "--:--:--";
+    return undefined;
   }
-}
-
-function tzCode(tz: string, now: number) {
-  try {
-    const parts = new Intl.DateTimeFormat("en-US", {
-      timeZone: tz,
-      timeZoneName: "short",
-    }).formatToParts(now);
-    return parts.find((p) => p.type === "timeZoneName")?.value || tz;
-  } catch {
-    return tz;
-  }
-}
-
-function calendarData(now: number) {
-  const d = new Date(now);
-  const year = d.getFullYear();
-  const month = d.getMonth();
-  const date = d.getDate();
-  const monthName = d.toLocaleString("en-US", { month: "long" });
-  const firstDay = new Date(year, month, 1).getDay();
-  const daysInMonth = new Date(year, month + 1, 0).getDate();
-  const dow = d.toLocaleString("en-US", { weekday: "long" });
-  const rows: (number | null)[][] = [];
-  let row: (number | null)[] = [];
-  for (let i = 0; i < firstDay; i++) row.push(null);
-  for (let day = 1; day <= daysInMonth; day++) {
-    row.push(day);
-    if (row.length === 7) {
-      rows.push(row);
-      row = [];
+  while (owner) {
+    const context = owner.context;
+    if (context && typeof context === "object") {
+      for (const key of Object.getOwnPropertySymbols(context)) {
+        const value = (context as any)[key];
+        if (
+          value &&
+          typeof value === "object" &&
+          value.slots &&
+          typeof value.slots.resolved === "function" &&
+          typeof value.registered === "function"
+        ) {
+          return value;
+        }
+      }
     }
+    owner = owner.owner;
   }
-  if (row.length) {
-    while (row.length < 7) row.push(null);
-    rows.push(row);
+  return undefined;
+}
+
+// Every claim that targets the sidebar and was displaced by our `replace`
+// claim. These are the real blocks other plugins registered, so rendering them
+// keeps each plugin's own component, settings and version.
+function suppressedSidebarClaims(host: any): any[] {
+  if (!host) return [];
+  let resolved: any;
+  try {
+    resolved = host.slots.resolved();
+  } catch {
+    return [];
   }
-  return { year, date, monthName, dow, rows };
+  const mine = resolved?.slotted?.get?.(SIDEBAR_SLOT)?.replace;
+  if (!mine) return [];
+  const claims: any[] = [];
+  for (const entry of resolved.suppressed ?? []) {
+    const claim = entry?.claim;
+    if (!claim || claim.plugin === PLUGIN_ID) continue;
+    if (claim.placement?.target !== SIDEBAR_SLOT) continue;
+    const by = entry?.by;
+    if (by !== mine && by?.plugin !== PLUGIN_ID) continue;
+    claims.push(claim);
+  }
+  return claims;
+}
+
+function normalizeName(value: string) {
+  return String(value)
+    .toLowerCase()
+    .replace(/^.*[/:]/, "")
+    .replace(/^opencode[-_]?/, "")
+    .replace(/[^a-z0-9]/g, "");
+}
+
+function shortenVersion(value: string) {
+  return /^[a-f0-9]{40}$/i.test(value) || /^[a-f0-9]{64}$/i.test(value)
+    ? value.slice(0, 7)
+    : value;
+}
+
+function isBuiltin(id: string) {
+  return BUILTIN.test(String(id));
+}
+
+// Friendly default heading for an adopted plugin, so the sidebar does not show
+// raw reverse-DNS ids such as "opencode.sidebar.mcp".
+function defaultTitle(id: string) {
+  const tail = String(id)
+    .replace(/^opencode[./]/, "")
+    .replace(/^sidebar[./]/, "")
+    .replace(/^plugin[./]/, "");
+  const last = tail.split(/[./]/).filter(Boolean).pop() ?? String(id);
+  return (
+    last
+      .split(/[-_]/)
+      .filter(Boolean)
+      .map(
+        (word) =>
+          ACRONYMS[word.toLowerCase()] ??
+          word.charAt(0).toUpperCase() + word.slice(1),
+      )
+      .join(" ") || String(id)
+  );
 }
 
 export default Plugin.define({
-  id: "sidebar.layout",
+  id: PLUGIN_ID,
   async setup(context: any) {
-    const currentTz = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
     const home = (globalThis as any)?.process?.env?.HOME || "/home/craig";
     const configPath = `${home}/.config/opencode/sidebar-layout.json`;
     const defaults = {
-      zones: [currentTz],
-      sections: {
-        mcpCost: { order: 0, visible: true, color: "base" },
-        clocks: { order: 1, visible: true, color: "base" },
-        calendar: { order: 2, visible: true, color: "muted" },
-        plugins: { order: 3, visible: true, color: "base" },
-      },
+      mode: "adopt",
+      includeBuiltin: false,
+      collapseByDefault: context.options?.collapsedByDefault !== false,
+      sections: {} as Record<string, SectionConfig>,
     };
     let loaded: any = defaults;
     try {
@@ -101,19 +157,17 @@ export default Plugin.define({
         ...defaults,
         ...JSON.parse(fsMod.readFileSync(configPath, "utf8")),
       };
-      fsMod.writeFileSync(configPath, JSON.stringify(loaded, null, 2) + "\n");
-    } catch {
-      try {
-        const fsMod: any = await import("node:fs");
-        fsMod.writeFileSync(
-          configPath,
-          JSON.stringify(defaults, null, 2) + "\n",
-        );
-      } catch {}
-    }
+      if (!loaded.sections || typeof loaded.sections !== "object") {
+        loaded.sections = {};
+      }
+    } catch {}
+
     const [config, setConfig] = createSignal<any>(loaded);
     const updateConfig = async (fn: (draft: any) => void) => {
       const draft = JSON.parse(JSON.stringify(config()));
+      if (!draft.sections || typeof draft.sections !== "object") {
+        draft.sections = {};
+      }
       fn(draft);
       setConfig(draft);
       try {
@@ -122,271 +176,322 @@ export default Plugin.define({
       } catch {}
     };
 
-    const [now, setNow] = createSignal(Date.now());
-    const timer = setInterval(() => setNow(Date.now()), 1000);
+    const [detected, setDetected] = createSignal<string[]>([]);
 
-    const [snapshot] = createResource(async () => {
+    // Best-effort version/source label per plugin, from the server inventory
+    // first and the local TUI plugin list second.
+    const [sources] = createResource(async () => {
+      const index: Record<string, string> = {};
       try {
-        const fsMod: any = await import("node:fs");
-        const home = (globalThis as any)?.process?.env?.HOME || "/home/craig";
-        return JSON.parse(
-          fsMod.readFileSync(
-            `${home}/.config/mcp-savings/snapshot.json`,
-            "utf8",
-          ),
-        );
-      } catch {
-        return null;
-      }
-    });
-
-    const [plugins] = createResource(async () => {
-      const location = context.location ?? context.data.location.default();
-      const list: any[] = [];
-      try {
+        const location = context.location ?? context.data.location.default();
         const res = await context.client.plugin.list({ location });
         const rows = (res && (res.data ?? res)) || [];
-        if (Array.isArray(rows)) list.push(...rows);
+        for (const row of Array.isArray(rows) ? rows : []) {
+          const version = row?.source?.version;
+          const target = row?.source?.target;
+          const label = version
+            ? shortenVersion(String(version))
+            : target
+              ? String(target)
+              : undefined;
+          if (!label) continue;
+          if (row?.id) index[normalizeName(String(row.id))] = label;
+          if (target) index[normalizeName(String(target))] = label;
+        }
       } catch {}
       try {
         const fsMod: any = await import("node:fs");
-        const home = (globalThis as any)?.process?.env?.HOME || "/home/craig";
         const parsed = JSON.parse(
           fsMod.readFileSync(`${home}/.config/opencode/cli.json`, "utf8"),
         );
         for (const entry of parsed?.plugins ?? []) {
           const spec = typeof entry === "string" ? entry : entry?.package;
-          if (!spec) continue;
-          list.push({
-            id: String(spec).split("/").pop(),
-            features: { tui: true },
-            state: { status: "active" },
-          });
+          if (typeof spec !== "string") continue;
+          if (spec === "*" || spec.startsWith("-")) continue;
+          const key = normalizeName(spec);
+          if (key && !index[key]) index[key] = spec;
         }
       } catch {}
-      return list;
+      return index;
     });
+
+    const section = (id: string): SectionConfig =>
+      config()?.sections?.[id] ?? {};
+    const collapseDefault = () => config()?.collapseByDefault !== false;
+    const includeBuiltin = () => config()?.includeBuiltin === true;
+    // Built-ins pass through untouched by default; third-party plugins are
+    // always managed. Setting includeBuiltin adopts the host's own sections too.
+    const isManaged = (id: string) => includeBuiltin() || !isBuiltin(id);
+    // No layout-drawn heading by default: every known sidebar plugin already
+    // renders its own heading, so drawing a second one would duplicate it. This
+    // also keeps the default safe for third-party plugins the layout has never
+    // seen. A section that wants a managed heading sets header: true.
+    const hasHeader = (id: string) =>
+      isManaged(id) && section(id).header === true;
+    const isVisible = (id: string) => section(id).visible !== false;
+    const isCollapsed = (id: string) =>
+      section(id).collapsed ?? collapseDefault();
+    const colorName = (id: string) => section(id).color ?? "base";
+    const labelFor = (id: string) =>
+      section(id).title ?? KNOWN_TITLES[id] ?? defaultTitle(id);
+    const versionFor = (id: string) => {
+      const label = sources()?.[normalizeName(id)];
+      return label ? ` · ${label}` : "";
+    };
+
+    const setSection = (id: string, patch: Partial<SectionConfig>) =>
+      updateConfig((draft) => {
+        draft.sections[id] = { ...(draft.sections[id] ?? {}), ...patch };
+      });
+
+    // Managed groups keep their registered order unless an explicit section
+    // order moves them. Built-in pass-through groups always keep their slot.
+    const orderKey = (group: { id: string; index: number }) => {
+      const order = section(group.id).order;
+      if (typeof order === "number") return order;
+      return 1e3 + group.index;
+    };
+
+    const orderedIds = () =>
+      detected()
+        .map((id, index) => ({ id, index }))
+        .filter((group) => isManaged(group.id))
+        .sort((a, b) => orderKey(a) - orderKey(b) || a.index - b.index)
+        .map((group) => group.id);
+
+    function reorder(id: string, delta: number) {
+      const ids = orderedIds();
+      const index = ids.indexOf(id);
+      const target = index + delta;
+      if (index < 0 || target < 0 || target >= ids.length) return;
+      const next = ids.slice();
+      next.splice(target, 0, next.splice(index, 1)[0]);
+      updateConfig((draft) => {
+        next.forEach((sid, i) => {
+          draft.sections[sid] = { ...(draft.sections[sid] ?? {}), order: i };
+        });
+      });
+    }
 
     function color(name: string) {
       return (context.theme?.text as any)?.[name] ?? context.theme?.text?.base;
     }
 
-    function sectionColor(id: SectionID) {
-      return color(config()?.sections?.[id]?.color ?? "base");
-    }
-
-    // Configurable via cli.json/opencode.json plugin options; every section starts
-    // collapsed unless explicitly expanded with { "collapsedByDefault": false }.
-    const collapsedByDefault = context.options?.collapsedByDefault !== false;
-    const [open, setOpen] = createSignal<Record<string, boolean>>(
-      Object.fromEntries(SECTIONS.map((id) => [id, !collapsedByDefault])),
-    );
-
-    function header(id: SectionID, title: string) {
+    function Managed(props: { input: any }) {
       const ctx = usePlugin();
-      return (
-        <box
-          onMouseDown={(e: any) => {
-            try {
-              e?.stopPropagation?.();
-            } catch {}
-            setOpen({ ...open(), [id]: !open()[id] });
-          }}
+      const groups = createMemo(() => {
+        const map = new Map<
+          string,
+          { id: string; index: number; claims: any[] }
+        >();
+        let index = 0;
+        for (const claim of suppressedSidebarClaims(hostFromOwner())) {
+          const id = String(claim.plugin);
+          let group = map.get(id);
+          if (!group) {
+            group = { id, index: index++, claims: [] };
+            map.set(id, group);
+          }
+          group.claims.push(claim);
+        }
+        return [...map.values()];
+      });
+      createEffect(() => setDetected(groups().map((group) => group.id)));
+
+      const visibleGroups = createMemo(() =>
+        groups()
+          .filter((group) => isVisible(group.id))
+          .sort((a, b) => orderKey(a) - orderKey(b) || a.index - b.index),
+      );
+
+      const claimView = (claim: any, id: string) => (
+        <ErrorBoundary
+          fallback={(error: any) => (
+            <text fg={ctx.theme.text.error}>{`${id}: ${String(error)}`}</text>
+          )}
         >
-          <text fg={sectionColor(id)} attributes={TextAttributes.BOLD}>
-            {(open()[id] ? "▼ " : "▶ ") + title}
-          </text>
+          {claim.render(props.input)}
+        </ErrorBoundary>
+      );
+
+      return (
+        <box flexDirection="column" marginTop={1}>
+          <For each={visibleGroups()}>
+            {(group) =>
+              hasHeader(group.id) ? (
+                <box flexDirection="column" marginTop={1}>
+                  <box
+                    onMouseDown={(e: any) => {
+                      try {
+                        e?.stopPropagation?.();
+                      } catch {}
+                      setSection(group.id, {
+                        collapsed: !isCollapsed(group.id),
+                      });
+                    }}
+                  >
+                    <text
+                      fg={color(colorName(group.id))}
+                      attributes={TextAttributes.BOLD}
+                    >
+                      {(isCollapsed(group.id) ? "▶ " : "▼ ") +
+                        labelFor(group.id) +
+                        versionFor(group.id)}
+                    </text>
+                  </box>
+                  <Show when={!isCollapsed(group.id)}>
+                    <box flexDirection="column" paddingLeft={1}>
+                      <For each={group.claims}>
+                        {(claim: any) => claimView(claim, group.id)}
+                      </For>
+                    </box>
+                  </Show>
+                </box>
+              ) : (
+                <box flexDirection="column">
+                  <For each={group.claims}>
+                    {(claim: any) => claimView(claim, group.id)}
+                  </For>
+                </box>
+              )
+            }
+          </For>
         </box>
       );
     }
 
-    async function configureZones() {
-      for (;;) {
-        const selected = new Set(config()?.zones ?? [currentTz]);
-        const opts = ZONES.map((z) => ({
-          title: `${selected.has(z.id) ? "✓ " : "  "}${z.city} (${z.code})`,
-          value: z.id,
-        }));
-        const choice = await context.ui.dialog.select({
-          title: "Toggle timezone (Esc to finish)",
-          options: opts,
-        });
-        if (!choice) return;
-        const next = new Set(selected);
-        if (next.has(choice)) next.delete(choice);
-        else next.add(choice);
-        if (next.size === 0) next.add(currentTz);
-        await updateConfig((d: any) => {
-          d.zones = Array.from(next);
-        });
-      }
-    }
-
-    async function configure() {
-      const sec = await context.ui.dialog.select({
-        title: "Sidebar section",
-        options: SECTIONS.map((id) => ({
-          title: `${config()?.sections?.[id]?.visible === false ? "hidden" : "shown"} · ${id}`,
-          value: id,
-        })),
-      });
-      if (!sec) return;
-      const actions = await context.ui.dialog.select({
-        title: `Configure ${sec}`,
-        options: [
-          { title: "Toggle visibility", value: "visible" },
-          { title: "Move up", value: "up" },
-          { title: "Move down", value: "down" },
-          { title: "Set colour", value: "color" },
-          { title: "Select timezones", value: "zones" },
-        ],
-      });
-      if (!actions) return;
-      if (actions === "zones") return configureZones();
-      if (actions === "color") {
-        const c = await context.ui.dialog.select({
-          title: "Colour",
-          options: COLORS.map((x) => ({ title: x, value: x })),
-        });
-        if (!c) return;
-        await updateConfig((d: any) => {
-          d.sections[sec].color = c;
+    async function openPluginSettings(id: string) {
+      let commands: any[] = [];
+      try {
+        commands = Array.from(context.keymap.commands() ?? []);
+      } catch {}
+      const matches = commands.filter(
+        (command) =>
+          command?.palette &&
+          typeof command?.id === "string" &&
+          command.id.startsWith(`${id}.`),
+      );
+      if (!matches.length) {
+        await context.ui.dialog.alert({
+          title: labelFor(id),
+          message: `No settings command found for ${id}.`,
         });
         return;
       }
-      await updateConfig((d: any) => {
-        const current = d.sections[sec];
-        if (actions === "visible") current.visible = !current.visible;
-        if (actions === "up") current.order = current.order - 1;
-        if (actions === "down") current.order = current.order + 1;
+      if (matches.length === 1) {
+        context.keymap.dispatch(matches[0].id);
+        return;
+      }
+      const pick = await context.ui.dialog.select({
+        title: `${labelFor(id)} settings`,
+        options: matches.map((command) => ({
+          title: command.title ?? command.id,
+          value: command.id,
+        })),
+      });
+      if (pick) context.keymap.dispatch(pick);
+    }
+
+    async function configure() {
+      const ids = orderedIds();
+      if (!ids.length) {
+        await context.ui.dialog.alert({
+          title: "Sidebar layout",
+          message:
+            "No adopted sidebar sections detected. Open a session so the sidebar mounts, or set includeBuiltin in sidebar-layout.json to manage the host's own sections.",
+        });
+        return;
+      }
+      const pick = await context.ui.dialog.select({
+        title: "Sidebar section",
+        options: ids.map((id) => ({
+          title: `${isVisible(id) ? "shown" : "hidden"} · ${
+            hasHeader(id)
+              ? isCollapsed(id)
+                ? "collapsed"
+                : "expanded"
+              : "no heading"
+          } · ${labelFor(id)}`,
+          value: id,
+        })),
+      });
+      if (!pick) return;
+      const action = await context.ui.dialog.select({
+        title: `Configure ${labelFor(pick)}`,
+        options: [
+          { title: "Toggle visibility", value: "visible" },
+          {
+            title: hasHeader(pick)
+              ? "Remove layout heading"
+              : "Add layout heading",
+            value: "header",
+          },
+          { title: "Move up", value: "up" },
+          { title: "Move down", value: "down" },
+          { title: "Toggle collapsed", value: "collapsed" },
+          { title: "Set colour", value: "color" },
+          { title: "Rename", value: "title" },
+          { title: "Open plugin settings", value: "settings" },
+        ],
+      });
+      if (!action) return;
+      if (action === "settings") return openPluginSettings(pick);
+      if (action === "visible")
+        return setSection(pick, { visible: !isVisible(pick) });
+      if (action === "header")
+        return setSection(pick, { header: !hasHeader(pick) });
+      if (action === "collapsed")
+        return setSection(pick, { collapsed: !isCollapsed(pick) });
+      if (action === "up" || action === "down")
+        return reorder(pick, action === "up" ? -1 : 1);
+      if (action === "title") {
+        const title = await context.ui.dialog.prompt({
+          title: "Section title",
+          value: labelFor(pick),
+        });
+        if (title !== undefined) setSection(pick, { title: title || pick });
+        return;
+      }
+      if (action === "color") {
+        const choice = await context.ui.dialog.select({
+          title: "Colour",
+          options: COLORS.map((c) => ({ title: c, value: c })),
+        });
+        if (choice) setSection(pick, { color: choice });
+      }
+    }
+
+    // Sidebar plugins that own their settings expose a command under their own
+    // id, so the layout can offer a shortcut once a plugin is adopted.
+    function Probe() {
+      onMount(() => {
+        upgrade();
+      });
+      return <box />;
+    }
+
+    let dispose: (() => void) | undefined;
+    let upgraded = false;
+
+    function upgrade() {
+      if (upgraded) return;
+      if (!hostFromOwner()) return;
+      upgraded = true;
+      try {
+        dispose?.();
+      } catch {}
+      dispose = context.ui.slot({
+        replace: SIDEBAR_SLOT,
+        render: (slotInput: any) => <Managed input={slotInput} />,
       });
     }
 
-    context.ui.slot({
-      prepend: "sidebar.content",
-      render: () => {
-        const ctx = usePlugin();
-        const nowVal = now();
-        const ordered = SECTIONS.filter(
-          (id) => config()?.sections?.[id]?.visible !== false,
-        ).sort(
-          (a, b) =>
-            (config()?.sections?.[a]?.order ?? 0) -
-            (config()?.sections?.[b]?.order ?? 0),
-        );
-        return (
-          <box flexDirection="column" marginTop={1}>
-            <For each={ordered}>
-              {(id: SectionID) => (
-                <box flexDirection="column" marginTop={1}>
-                  {header(
-                    id,
-                    id === "mcpCost"
-                      ? "MCP cost/request"
-                      : id === "clocks"
-                        ? "Clocks"
-                        : id === "calendar"
-                          ? "Calendar"
-                          : "Plugins",
-                  )}
-                  <Show when={open()[id]}>
-                    <box flexDirection="column" paddingLeft={1}>
-                      <Show when={id === "mcpCost"}>
-                        <Show
-                          when={!snapshot()}
-                          fallback={
-                            <box flexDirection="column">
-                              <text
-                                fg={ctx.theme.text.muted}
-                              >{`Updated: ${new Date(snapshot()?.timestamp).toLocaleString()}`}</text>
-                              <For each={snapshot()?.mcpMeasurement ?? []}>
-                                {(m: any) => (
-                                  <text
-                                    fg={ctx.theme.text.base}
-                                  >{`${m.server}: ${m.tokens != null ? m.tokens + " tok" : "n/a"}  (${m.bytes} B)`}</text>
-                                )}
-                              </For>
-                              <text
-                                fg={ctx.theme.text.muted}
-                              >{`Total: ${snapshot()?.totalSchemaBytes ?? 0} B`}</text>
-                            </box>
-                          }
-                        >
-                          <text fg={ctx.theme.text.muted}>No snapshot</text>
-                        </Show>
-                      </Show>
-                      <Show when={id === "clocks"}>
-                        <For each={config()?.zones ?? [currentTz]}>
-                          {(tz: string) => (
-                            <text
-                              fg={ctx.theme.text.base}
-                            >{`${zoneInfo(tz).city} (${tzCode(tz, nowVal)}): ${formatTime(tz, nowVal)}`}</text>
-                          )}
-                        </For>
-                      </Show>
-                      <Show when={id === "calendar"}>
-                        {(() => {
-                          const cal = calendarData(nowVal);
-                          return (
-                            <box flexDirection="column">
-                              <text
-                                fg={sectionColor("calendar")}
-                              >{`${cal.monthName} ${cal.year}`}</text>
-                              <text fg={ctx.theme.text.muted}>
-                                {"Su Mo Tu We Th Fr Sa"}
-                              </text>
-                              <For each={cal.rows}>
-                                {(week: (number | null)[]) => (
-                                  <box flexDirection="row">
-                                    <For each={week}>
-                                      {(day: number | null) => (
-                                        <text
-                                          width={3}
-                                          fg={
-                                            day === cal.date
-                                              ? ctx.theme.text.success
-                                              : ctx.theme.text.muted
-                                          }
-                                          attributes={
-                                            day === cal.date
-                                              ? TextAttributes.BOLD
-                                              : 0
-                                          }
-                                        >
-                                          {day
-                                            ? String(day).padStart(2, " ") + " "
-                                            : "   "}
-                                        </text>
-                                      )}
-                                    </For>
-                                  </box>
-                                )}
-                              </For>
-                              <text
-                                fg={ctx.theme.text.muted}
-                              >{`${cal.dow}, ${cal.monthName} ${cal.date}, ${cal.year}`}</text>
-                            </box>
-                          );
-                        })()}
-                      </Show>
-                      <Show when={id === "plugins"}>
-                        <For each={plugins() ?? []}>
-                          {(p: any) => (
-                            <text
-                              fg={ctx.theme.text.base}
-                            >{`${p.id ?? p.source?.target ?? "plugin"}  ${p.state?.status ?? "unknown"}`}</text>
-                          )}
-                        </For>
-                      </Show>
-                    </box>
-                  </Show>
-                </box>
-              )}
-            </For>
-          </box>
-        );
-      },
-    });
+    if (config()?.mode !== "coexist") {
+      dispose = context.ui.slot({
+        prepend: SIDEBAR_SLOT,
+        render: () => <Probe />,
+      });
+    }
 
     context.keymap.layer(() => ({
       mode: "global",
@@ -404,6 +509,10 @@ export default Plugin.define({
       ],
     }));
 
-    return () => clearInterval(timer);
+    return () => {
+      try {
+        dispose?.();
+      } catch {}
+    };
   },
 });

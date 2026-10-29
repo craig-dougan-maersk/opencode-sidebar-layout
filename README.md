@@ -1,17 +1,95 @@
 # OpenCode sidebar layout
 
-Solid/OpenTUI sidebar sections for MCP cost, clocks, calendar and plugins.
+A sidebar host for OpenCode. Instead of re-implementing clocks, plugin lists and
+costs, this plugin installs nothing itself: it adopts the sidebar sections that
+other plugins register and gives you one place to order, show, hide, collapse,
+rename and colour them — including third-party plugins, with no fork.
+
 The `./tui` export loads committed JavaScript from `dist/tui.js`, not raw TSX.
 The Solid universal compiler targets `@opentui/solid`; host runtime imports
 remain external. No React dependency or bundled renderer is introduced.
 
-## Collapsed by default
+## How adoption works
 
-Every section starts collapsed, so the sidebar stays quiet until you open the
-part you need. Click a section header to expand or collapse it.
+The host exposes a single `sidebar.content` slot that every sidebar plugin claims
+into (`prepend`, `append`, `before`, `after` or `replace`). The host only renders
+one `replace` claim per slot and suppresses the claims it displaces, so the
+layout plugin:
 
-Set `collapsedByDefault` to `false` in the plugin options to start with every
-section expanded instead:
+1. claims `prepend: "sidebar.content"` with a tiny probe while it looks for the
+   host context, then
+2. once found, disposes the probe and re-claims `replace: "sidebar.content"`, and
+3. re-renders every suppressed sibling claim — the real component registered by
+   each plugin, with that plugin's own context, so each plugin's own settings
+   keep working.
+
+The host context is reached by walking the Solid owner chain to the provider that
+exposes the resolved slot graph. Nothing about the other plugins is forked or
+copied, and no other plugin needs a code change to appear here. If the host
+context cannot be found, the layout stays inert and the sidebar simply renders
+the way the host would have rendered it (no suppression).
+
+Adopted sections are grouped per plugin and re-rendered exactly as that plugin
+registered them, so each keeps its own heading, collapsible state and settings.
+The layout never draws a second heading by default: every known sidebar plugin
+already renders its own, and defaulting to no heading also keeps the behaviour
+safe for third-party plugins the layout has never seen. A section that wants a
+layout-managed heading opts in with `header: true`.
+
+## Host sections versus third-party sections
+
+The single `replace` claim necessarily displaces the host's own sidebar sections
+(session context, limits, MCP servers, todos) as well as third-party ones. By
+default those host sections are re-rendered unchanged — no heading, always
+visible — so the built-in sidebar looks the same. Set `includeBuiltin` to `true`
+to adopt the host sections into the same heading/order/visibility model.
+
+## Configuration
+
+Settings live in `~/.config/opencode/sidebar-layout.json` and are edited with the
+`Configure sidebar layout` command (palette entry, or `/sidebar-layout`):
+
+```jsonc title="~/.config/opencode/sidebar-layout.json"
+{
+  // "adopt" (default) hosts other plugins' sidebar sections; "coexist" disables
+  // hosting entirely so every plugin renders exactly as the host would render it.
+  "mode": "adopt",
+  // Also adopt the host's own sidebar sections (default: false, they pass through).
+  "includeBuiltin": false,
+  // New sections start collapsed unless a section overrides it.
+  "collapseByDefault": true,
+  // Keyed by the plugin id that registered the section.
+  "sections": {
+    "plugins.pane": {
+      "order": 0,
+      "visible": true
+    },
+    "timezone.clocks": {
+      "order": 1,
+      "visible": true,
+      // Opt in to a layout-drawn heading; the plugin's own heading is used
+      // otherwise (the default, so nothing is ever duplicated).
+      "header": true,
+      "color": "info",
+      "title": "Clocks"
+    }
+  }
+}
+```
+
+- `order` — lower sorts first among managed sections; unset keeps registration order.
+- `visible` — set `false` to hide a section entirely.
+- `header` — set `true` to have the layout draw its own collapsible heading
+  instead of relying on the plugin's. Defaults to `false`, because every known
+  sidebar plugin already draws its own heading; the default is also safe for
+  third-party plugins the layout has not seen. `title`, `color` and `collapsed`
+  only apply when a heading is drawn.
+- `collapsed` — per-section override of `collapseByDefault` for headed sections.
+- `color` — one of `base`, `muted`, `success`, `warning`, `error`, `info`.
+- `title` — heading text; defaults to a friendly name derived from the plugin id.
+
+`collapsedByDefault` can also be set in the plugin options, which is equivalent
+to `collapseByDefault`:
 
 ```jsonc title="cli.json"
 {
@@ -23,8 +101,6 @@ section expanded instead:
   ]
 }
 ```
-
-Absent or `true` keeps the collapsed default.
 
 ## Development
 
@@ -54,8 +130,9 @@ only. Dependency overrides are not inherited by consumers; this does not
 patch OpenCode's host or a consumer's dependency graph. Existing runtime
 dependency and peer ranges are unchanged; the lockfile pins the tested graph.
 
-Packaging checks do not execute plugin setup, which writes local settings.
-Rendering, mouse interactions and reload persistence need separate host
-verification. This plugin already includes clocks/calendar/plugins sections;
-other sidebar plugins may overlap. No sections or host settings are changed
-by this packaging fix.
+Packaging checks do not execute plugin setup for rendering. Adoption is exercised
+by a setup probe (claim shape in `adopt` versus `coexist`); the live suppression
+and re-render path needs host verification after a TUI restart. Adoption depends
+on the host's internal slot graph being reachable from a plugin render through
+the shared Solid owner chain; if a future host version changes that, the plugin
+falls back to rendering nothing of its own and the host's sidebar is unchanged.
