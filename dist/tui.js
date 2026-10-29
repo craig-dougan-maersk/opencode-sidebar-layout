@@ -309,6 +309,7 @@ export default Plugin.define({
           })() : (() => {
             var _el$7 = _$createElement("box");
             _$setProp(_el$7, "flexDirection", "column");
+            _$setProp(_el$7, "marginTop", 1);
             _$insert(_el$7, _$createComponent(For, {
               get each() {
                 return group.claims;

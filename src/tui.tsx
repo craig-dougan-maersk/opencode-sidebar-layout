@@ -348,7 +348,7 @@ export default Plugin.define({
                   </Show>
                 </box>
               ) : (
-                <box flexDirection="column">
+                <box flexDirection="column" marginTop={1}>
                   <For each={group.claims}>
                     {(claim: any) => claimView(claim, group.id)}
                   </For>
