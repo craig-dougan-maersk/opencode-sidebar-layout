@@ -59,11 +59,13 @@ Settings live in `~/.config/opencode/sidebar-layout.json` and are edited with th
   "includeBuiltin": false,
   // New sections start collapsed unless a section overrides it.
   "collapseByDefault": true,
+  // Ctrl + drag a section up or down to reorder it (default: true).
+  "dragReorder": true,
   // Keyed by the plugin id that registered the section.
   "sections": {
     "plugins.pane": {
       "order": 0,
-      "visible": true
+      "visible": true,
     },
     "timezone.clocks": {
       "order": 1,
@@ -72,9 +74,9 @@ Settings live in `~/.config/opencode/sidebar-layout.json` and are edited with th
       // otherwise (the default, so nothing is ever duplicated).
       "header": true,
       "color": "info",
-      "title": "Clocks"
-    }
-  }
+      "title": "Clocks",
+    },
+  },
 }
 ```
 
@@ -88,6 +90,26 @@ Settings live in `~/.config/opencode/sidebar-layout.json` and are edited with th
 - `collapsed` — per-section override of `collapseByDefault` for headed sections.
 - `color` — one of `base`, `muted`, `success`, `warning`, `error`, `info`.
 - `title` — heading text; defaults to a friendly name derived from the plugin id.
+- `dragReorder` — set `false` to disable ctrl + drag reordering of sections.
+
+## Reordering
+
+Two ways to reorder sections, beyond setting `order` by hand:
+
+- In the `Configure sidebar layout` command, choose a section and then `Move up`
+  or `Move down`. The action menu stays on the move entry after each move, so a
+  section can be nudged repeatedly without reopening the menu, and the two moves
+  are also bound to `alt+up` and `alt+down` as dialog footer actions, which the
+  host triggers without closing the dialog. `Escape` returns to the section
+  list; a second `Escape` at the list closes the command.
+- Hold `Ctrl` and drag a section up or down. A status line above the sidebar
+  shows where the section will land. `Ctrl` is required: the renderer starts a
+  text selection on a plain or `Alt` drag over the plugins' selectable text, and
+  `Ctrl` is the only modifier it excludes from that path. Set `dragReorder` to
+  `false` to turn dragging off.
+
+Both write the same explicit per-section `order` index used by the `order`
+setting.
 
 `collapsedByDefault` can also be set in the plugin options, which is equivalent
 to `collapseByDefault`:
@@ -97,9 +119,9 @@ to `collapseByDefault`:
   "plugins": [
     {
       "package": "craig-dougan-maersk/opencode-sidebar-layout",
-      "options": { "collapsedByDefault": true }
-    }
-  ]
+      "options": { "collapsedByDefault": true },
+    },
+  ],
 }
 ```
 
