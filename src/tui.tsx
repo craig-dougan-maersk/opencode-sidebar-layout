@@ -139,6 +139,29 @@ function defaultTitle(id: string) {
   );
 }
 
+// Pure list reorder used by drag reordering: moves `id` to sit immediately
+// before or after `targetId`, keeping every other entry in relative order.
+// Returns the new order, or undefined when the move would change nothing.
+export function moveWithin(
+  ids: string[],
+  id: string,
+  targetId: string,
+  after: boolean,
+): string[] | undefined {
+  if (id === targetId) return undefined;
+  const from = ids.indexOf(id);
+  if (from < 0) return undefined;
+  const next = ids.slice();
+  next.splice(from, 1);
+  const at = next.indexOf(targetId);
+  if (at < 0) return undefined;
+  next.splice(after ? at + 1 : at, 0, id);
+  for (let i = 0; i < next.length; i += 1) {
+    if (next[i] !== ids[i]) return next;
+  }
+  return undefined;
+}
+
 export default Plugin.define({
   id: PLUGIN_ID,
   async setup(context: any) {
@@ -148,6 +171,7 @@ export default Plugin.define({
       mode: "adopt",
       includeBuiltin: false,
       collapseByDefault: context.options?.collapsedByDefault !== false,
+      dragReorder: true,
       sections: {} as Record<string, SectionConfig>,
     };
     let loaded: any = defaults;
@@ -259,6 +283,16 @@ export default Plugin.define({
         .sort((a, b) => orderKey(a) - orderKey(b) || a.index - b.index)
         .map((group) => group.id);
 
+    // Ordering is persisted as an explicit `order` index per section, so a
+    // reorder survives the next launch and applies to hidden sections too.
+    function persistOrder(ids: string[]) {
+      updateConfig((draft) => {
+        ids.forEach((sid, i) => {
+          draft.sections[sid] = { ...(draft.sections[sid] ?? {}), order: i };
+        });
+      });
+    }
+
     function reorder(id: string, delta: number) {
       const ids = orderedIds();
       const index = ids.indexOf(id);
@@ -266,11 +300,14 @@ export default Plugin.define({
       if (index < 0 || target < 0 || target >= ids.length) return;
       const next = ids.slice();
       next.splice(target, 0, next.splice(index, 1)[0]);
-      updateConfig((draft) => {
-        next.forEach((sid, i) => {
-          draft.sections[sid] = { ...(draft.sections[sid] ?? {}), order: i };
-        });
-      });
+      persistOrder(next);
+    }
+
+    // Moves `id` to sit immediately before or after `targetId` and persists the
+    // new order. Used by drag reordering.
+    function moveTo(id: string, targetId: string, after: boolean) {
+      const next = moveWithin(orderedIds(), id, targetId, after);
+      if (next) persistOrder(next);
     }
 
     function color(name: string) {
@@ -304,6 +341,61 @@ export default Plugin.define({
           .sort((a, b) => orderKey(a) - orderKey(b) || a.index - b.index),
       );
 
+      // Drag reordering. Ctrl is the only modifier the renderer excludes from
+      // its text-selection path, so ctrl + left-drag reorders instead of
+      // selecting the section content under the pointer. Drag events reach the
+      // pressed renderable and bubble up to its section wrapper; `over` reaches
+      // the wrapper under the pointer; `drop` reaches the wrapper it lands on.
+      const [dragId, setDragId] = createSignal<string | undefined>();
+      const [dropTarget, setDropTarget] = createSignal<
+        { id: string; after: boolean } | undefined
+      >();
+      const dragEnabled = () => config()?.dragReorder !== false;
+
+      const onSectionMouse = (id: string, e: any) => {
+        if (!dragEnabled()) return;
+        const type = e?.type;
+        if (type === "down") {
+          if (e?.button === 0 && e?.modifiers?.ctrl) {
+            setDragId(id);
+            setDropTarget(undefined);
+          }
+          return;
+        }
+        if (type === "over") {
+          const active = dragId();
+          if (!active || active === id) return;
+          const rect = e?.currentTarget;
+          const top = rect?.screenY ?? rect?.y ?? 0;
+          const height = rect?.height ?? 0;
+          const after = Number(e?.y ?? top) > top + height / 2;
+          setDropTarget({ id, after });
+          return;
+        }
+        if (type === "drop") {
+          const active = dragId();
+          const target = dropTarget();
+          if (active && target && target.id !== active) {
+            moveTo(active, target.id, target.after);
+          }
+          setDropTarget(undefined);
+          return;
+        }
+        if (type === "up" || type === "drag-end") {
+          setDragId(undefined);
+          setDropTarget(undefined);
+        }
+      };
+
+      const dragStatus = () => {
+        const active = dragId();
+        if (!active) return "";
+        const target = dropTarget();
+        if (!target)
+          return `Moving ${labelFor(active)} · release over a section`;
+        return `Moving ${labelFor(active)} · ${target.after ? "after" : "before"} ${labelFor(target.id)}`;
+      };
+
       const claimView = (claim: any, id: string) => (
         <ErrorBoundary
           fallback={(error: any) => (
@@ -319,9 +411,16 @@ export default Plugin.define({
           <For each={visibleGroups()}>
             {(group) =>
               hasHeader(group.id) ? (
-                <box flexDirection="column" marginTop={1}>
+                <box
+                  flexDirection="column"
+                  marginTop={1}
+                  onMouse={(e: any) => onSectionMouse(group.id, e)}
+                >
                   <box
                     onMouseDown={(e: any) => {
+                      // Ctrl + drag reorders the section rather than collapsing
+                      // it, so the heading never toggles on a ctrl press.
+                      if (e?.modifiers?.ctrl) return;
                       try {
                         e?.stopPropagation?.();
                       } catch {}
@@ -348,7 +447,11 @@ export default Plugin.define({
                   </Show>
                 </box>
               ) : (
-                <box flexDirection="column" marginTop={1}>
+                <box
+                  flexDirection="column"
+                  marginTop={1}
+                  onMouse={(e: any) => onSectionMouse(group.id, e)}
+                >
                   <For each={group.claims}>
                     {(claim: any) => claimView(claim, group.id)}
                   </For>
@@ -356,6 +459,9 @@ export default Plugin.define({
               )
             }
           </For>
+          <Show when={dragStatus()}>
+            <text fg={color("info")}>{dragStatus()}</text>
+          </Show>
         </box>
       );
     }
@@ -392,9 +498,98 @@ export default Plugin.define({
       if (pick) context.keymap.dispatch(pick);
     }
 
+    // The section action menu keeps `Move up`/`Move down` open so a section can
+    // be nudged repeatedly without reopening the menu and re-selecting the
+    // entry. The move actions are also bound to alt+arrow as dialog footer
+    // actions, which the host triggers without closing the dialog. Escape
+    // returns to the section list; a second Escape at the list closes the flow.
+    async function configureSection(id: string): Promise<boolean> {
+      let sticky: string | undefined;
+      const actionOptions = () => [
+        { title: "Toggle visibility", value: "visible" },
+        {
+          title: hasHeader(id) ? "Remove layout heading" : "Add layout heading",
+          value: "header",
+        },
+        { title: "Move up", value: "up" },
+        { title: "Move down", value: "down" },
+        { title: "Toggle collapsed", value: "collapsed" },
+        { title: "Set colour", value: "color" },
+        { title: "Rename", value: "title" },
+        { title: "Open plugin settings", value: "settings" },
+      ];
+      for (;;) {
+        const action = await context.ui.dialog.select({
+          get title() {
+            return `Configure ${labelFor(id)}`;
+          },
+          get current() {
+            return sticky;
+          },
+          get options() {
+            return actionOptions();
+          },
+          get actions() {
+            return [
+              {
+                bind: "alt+up",
+                title: "Move up",
+                selection: "none" as const,
+                onTrigger: () => reorder(id, -1),
+              },
+              {
+                bind: "alt+down",
+                title: "Move down",
+                selection: "none" as const,
+                onTrigger: () => reorder(id, 1),
+              },
+            ];
+          },
+        });
+        if (!action) return true;
+        if (action === "up" || action === "down") {
+          sticky = action;
+          reorder(id, action === "up" ? -1 : 1);
+          continue;
+        }
+        if (action === "settings") {
+          await openPluginSettings(id);
+          return false;
+        }
+        if (action === "title") {
+          const title = await context.ui.dialog.prompt({
+            title: "Section title",
+            value: labelFor(id),
+          });
+          if (title !== undefined) setSection(id, { title: title || id });
+          return false;
+        }
+        if (action === "color") {
+          const choice = await context.ui.dialog.select({
+            title: "Colour",
+            options: COLORS.map((c) => ({ title: c, value: c })),
+          });
+          if (choice) setSection(id, { color: choice });
+          return false;
+        }
+        if (action === "visible") {
+          setSection(id, { visible: !isVisible(id) });
+          return false;
+        }
+        if (action === "header") {
+          setSection(id, { header: !hasHeader(id) });
+          return false;
+        }
+        if (action === "collapsed") {
+          setSection(id, { collapsed: !isCollapsed(id) });
+          return false;
+        }
+        return false;
+      }
+    }
+
     async function configure() {
-      const ids = orderedIds();
-      if (!ids.length) {
+      if (!orderedIds().length) {
         await context.ui.dialog.alert({
           title: "Sidebar layout",
           message:
@@ -402,9 +597,8 @@ export default Plugin.define({
         });
         return;
       }
-      const pick = await context.ui.dialog.select({
-        title: "Sidebar section",
-        options: ids.map((id) => ({
+      const sectionOptions = () =>
+        orderedIds().map((id) => ({
           title: `${isVisible(id) ? "shown" : "hidden"} · ${
             hasHeader(id)
               ? isCollapsed(id)
@@ -413,51 +607,16 @@ export default Plugin.define({
               : "no heading"
           } · ${labelFor(id)}`,
           value: id,
-        })),
-      });
-      if (!pick) return;
-      const action = await context.ui.dialog.select({
-        title: `Configure ${labelFor(pick)}`,
-        options: [
-          { title: "Toggle visibility", value: "visible" },
-          {
-            title: hasHeader(pick)
-              ? "Remove layout heading"
-              : "Add layout heading",
-            value: "header",
+        }));
+      for (;;) {
+        const pick = await context.ui.dialog.select({
+          title: "Sidebar section",
+          get options() {
+            return sectionOptions();
           },
-          { title: "Move up", value: "up" },
-          { title: "Move down", value: "down" },
-          { title: "Toggle collapsed", value: "collapsed" },
-          { title: "Set colour", value: "color" },
-          { title: "Rename", value: "title" },
-          { title: "Open plugin settings", value: "settings" },
-        ],
-      });
-      if (!action) return;
-      if (action === "settings") return openPluginSettings(pick);
-      if (action === "visible")
-        return setSection(pick, { visible: !isVisible(pick) });
-      if (action === "header")
-        return setSection(pick, { header: !hasHeader(pick) });
-      if (action === "collapsed")
-        return setSection(pick, { collapsed: !isCollapsed(pick) });
-      if (action === "up" || action === "down")
-        return reorder(pick, action === "up" ? -1 : 1);
-      if (action === "title") {
-        const title = await context.ui.dialog.prompt({
-          title: "Section title",
-          value: labelFor(pick),
         });
-        if (title !== undefined) setSection(pick, { title: title || pick });
-        return;
-      }
-      if (action === "color") {
-        const choice = await context.ui.dialog.select({
-          title: "Colour",
-          options: COLORS.map((c) => ({ title: c, value: c })),
-        });
-        if (choice) setSection(pick, { color: choice });
+        if (!pick) return;
+        if (!(await configureSection(pick))) return;
       }
     }
 

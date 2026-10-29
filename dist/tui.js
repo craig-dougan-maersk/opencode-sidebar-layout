@@ -95,6 +95,24 @@ function defaultTitle(id) {
   const last = tail.split(/[./]/).filter(Boolean).pop() ?? String(id);
   return last.split(/[-_]/).filter(Boolean).map(word => ACRONYMS[word.toLowerCase()] ?? word.charAt(0).toUpperCase() + word.slice(1)).join(" ") || String(id);
 }
+
+// Pure list reorder used by drag reordering: moves `id` to sit immediately
+// before or after `targetId`, keeping every other entry in relative order.
+// Returns the new order, or undefined when the move would change nothing.
+export function moveWithin(ids, id, targetId, after) {
+  if (id === targetId) return undefined;
+  const from = ids.indexOf(id);
+  if (from < 0) return undefined;
+  const next = ids.slice();
+  next.splice(from, 1);
+  const at = next.indexOf(targetId);
+  if (at < 0) return undefined;
+  next.splice(after ? at + 1 : at, 0, id);
+  for (let i = 0; i < next.length; i += 1) {
+    if (next[i] !== ids[i]) return next;
+  }
+  return undefined;
+}
 export default Plugin.define({
   id: PLUGIN_ID,
   async setup(context) {
@@ -104,6 +122,7 @@ export default Plugin.define({
       mode: "adopt",
       includeBuiltin: false,
       collapseByDefault: context.options?.collapsedByDefault !== false,
+      dragReorder: true,
       sections: {}
     };
     let loaded = defaults;
@@ -201,6 +220,19 @@ export default Plugin.define({
       id,
       index
     })).filter(group => isManaged(group.id)).sort((a, b) => orderKey(a) - orderKey(b) || a.index - b.index).map(group => group.id);
+
+    // Ordering is persisted as an explicit `order` index per section, so a
+    // reorder survives the next launch and applies to hidden sections too.
+    function persistOrder(ids) {
+      updateConfig(draft => {
+        ids.forEach((sid, i) => {
+          draft.sections[sid] = {
+            ...(draft.sections[sid] ?? {}),
+            order: i
+          };
+        });
+      });
+    }
     function reorder(id, delta) {
       const ids = orderedIds();
       const index = ids.indexOf(id);
@@ -208,14 +240,14 @@ export default Plugin.define({
       if (index < 0 || target < 0 || target >= ids.length) return;
       const next = ids.slice();
       next.splice(target, 0, next.splice(index, 1)[0]);
-      updateConfig(draft => {
-        next.forEach((sid, i) => {
-          draft.sections[sid] = {
-            ...(draft.sections[sid] ?? {}),
-            order: i
-          };
-        });
-      });
+      persistOrder(next);
+    }
+
+    // Moves `id` to sit immediately before or after `targetId` and persists the
+    // new order. Used by drag reordering.
+    function moveTo(id, targetId, after) {
+      const next = moveWithin(orderedIds(), id, targetId, after);
+      if (next) persistOrder(next);
     }
     function color(name) {
       return context.theme?.text?.[name] ?? context.theme?.text?.base;
@@ -242,6 +274,59 @@ export default Plugin.define({
       });
       createEffect(() => setDetected(groups().map(group => group.id)));
       const visibleGroups = createMemo(() => groups().filter(group => isVisible(group.id)).sort((a, b) => orderKey(a) - orderKey(b) || a.index - b.index));
+
+      // Drag reordering. Ctrl is the only modifier the renderer excludes from
+      // its text-selection path, so ctrl + left-drag reorders instead of
+      // selecting the section content under the pointer. Drag events reach the
+      // pressed renderable and bubble up to its section wrapper; `over` reaches
+      // the wrapper under the pointer; `drop` reaches the wrapper it lands on.
+      const [dragId, setDragId] = createSignal();
+      const [dropTarget, setDropTarget] = createSignal();
+      const dragEnabled = () => config()?.dragReorder !== false;
+      const onSectionMouse = (id, e) => {
+        if (!dragEnabled()) return;
+        const type = e?.type;
+        if (type === "down") {
+          if (e?.button === 0 && e?.modifiers?.ctrl) {
+            setDragId(id);
+            setDropTarget(undefined);
+          }
+          return;
+        }
+        if (type === "over") {
+          const active = dragId();
+          if (!active || active === id) return;
+          const rect = e?.currentTarget;
+          const top = rect?.screenY ?? rect?.y ?? 0;
+          const height = rect?.height ?? 0;
+          const after = Number(e?.y ?? top) > top + height / 2;
+          setDropTarget({
+            id,
+            after
+          });
+          return;
+        }
+        if (type === "drop") {
+          const active = dragId();
+          const target = dropTarget();
+          if (active && target && target.id !== active) {
+            moveTo(active, target.id, target.after);
+          }
+          setDropTarget(undefined);
+          return;
+        }
+        if (type === "up" || type === "drag-end") {
+          setDragId(undefined);
+          setDropTarget(undefined);
+        }
+      };
+      const dragStatus = () => {
+        const active = dragId();
+        if (!active) return "";
+        const target = dropTarget();
+        if (!target) return `Moving ${labelFor(active)} · release over a section`;
+        return `Moving ${labelFor(active)} · ${target.after ? "after" : "before"} ${labelFor(target.id)}`;
+      };
       const claimView = (claim, id) => _$createComponent(ErrorBoundary, {
         fallback: error => (() => {
           var _el$ = _$createElement("text");
@@ -262,14 +347,18 @@ export default Plugin.define({
             return visibleGroups();
           },
           children: group => hasHeader(group.id) ? (() => {
-            var _el$3 = _$createElement("box"),
-              _el$4 = _$createElement("box"),
-              _el$5 = _$createElement("text");
-            _$insertNode(_el$3, _el$4);
-            _$setProp(_el$3, "flexDirection", "column");
-            _$setProp(_el$3, "marginTop", 1);
+            var _el$4 = _$createElement("box"),
+              _el$5 = _$createElement("box"),
+              _el$6 = _$createElement("text");
             _$insertNode(_el$4, _el$5);
-            _$setProp(_el$4, "onMouseDown", e => {
+            _$setProp(_el$4, "flexDirection", "column");
+            _$setProp(_el$4, "marginTop", 1);
+            _$setProp(_el$4, "onMouse", e => onSectionMouse(group.id, e));
+            _$insertNode(_el$5, _el$6);
+            _$setProp(_el$5, "onMouseDown", e => {
+              // Ctrl + drag reorders the section rather than collapsing
+              // it, so the heading never toggles on a ctrl press.
+              if (e?.modifiers?.ctrl) return;
               try {
                 e?.stopPropagation?.();
               } catch {}
@@ -277,48 +366,60 @@ export default Plugin.define({
                 collapsed: !isCollapsed(group.id)
               });
             });
-            _$insert(_el$5, () => (isCollapsed(group.id) ? "▶ " : "▼ ") + labelFor(group.id) + versionFor(group.id));
-            _$insert(_el$3, _$createComponent(Show, {
+            _$insert(_el$6, () => (isCollapsed(group.id) ? "▶ " : "▼ ") + labelFor(group.id) + versionFor(group.id));
+            _$insert(_el$4, _$createComponent(Show, {
               get when() {
                 return !isCollapsed(group.id);
               },
               get children() {
-                var _el$6 = _$createElement("box");
-                _$setProp(_el$6, "flexDirection", "column");
-                _$setProp(_el$6, "paddingLeft", 1);
-                _$insert(_el$6, _$createComponent(For, {
+                var _el$7 = _$createElement("box");
+                _$setProp(_el$7, "flexDirection", "column");
+                _$setProp(_el$7, "paddingLeft", 1);
+                _$insert(_el$7, _$createComponent(For, {
                   get each() {
                     return group.claims;
                   },
                   children: claim => claimView(claim, group.id)
                 }));
-                return _el$6;
+                return _el$7;
               }
             }), null);
             _$effect(_p$ => {
               var _v$ = color(colorName(group.id)),
                 _v$2 = TextAttributes.BOLD;
-              _v$ !== _p$.e && (_p$.e = _$setProp(_el$5, "fg", _v$, _p$.e));
-              _v$2 !== _p$.t && (_p$.t = _$setProp(_el$5, "attributes", _v$2, _p$.t));
+              _v$ !== _p$.e && (_p$.e = _$setProp(_el$6, "fg", _v$, _p$.e));
+              _v$2 !== _p$.t && (_p$.t = _$setProp(_el$6, "attributes", _v$2, _p$.t));
               return _p$;
             }, {
               e: undefined,
               t: undefined
             });
-            return _el$3;
+            return _el$4;
           })() : (() => {
-            var _el$7 = _$createElement("box");
-            _$setProp(_el$7, "flexDirection", "column");
-            _$setProp(_el$7, "marginTop", 1);
-            _$insert(_el$7, _$createComponent(For, {
+            var _el$8 = _$createElement("box");
+            _$setProp(_el$8, "flexDirection", "column");
+            _$setProp(_el$8, "marginTop", 1);
+            _$setProp(_el$8, "onMouse", e => onSectionMouse(group.id, e));
+            _$insert(_el$8, _$createComponent(For, {
               get each() {
                 return group.claims;
               },
               children: claim => claimView(claim, group.id)
             }));
-            return _el$7;
+            return _el$8;
           })()
-        }));
+        }), null);
+        _$insert(_el$2, _$createComponent(Show, {
+          get when() {
+            return dragStatus();
+          },
+          get children() {
+            var _el$3 = _$createElement("text");
+            _$insert(_el$3, dragStatus);
+            _$effect(_$p => _$setProp(_el$3, "fg", color("info"), _$p));
+            return _el$3;
+          }
+        }), null);
         return _el$2;
       })();
     }
@@ -348,84 +449,139 @@ export default Plugin.define({
       });
       if (pick) context.keymap.dispatch(pick);
     }
+
+    // The section action menu keeps `Move up`/`Move down` open so a section can
+    // be nudged repeatedly without reopening the menu and re-selecting the
+    // entry. The move actions are also bound to alt+arrow as dialog footer
+    // actions, which the host triggers without closing the dialog. Escape
+    // returns to the section list; a second Escape at the list closes the flow.
+    async function configureSection(id) {
+      let sticky;
+      const actionOptions = () => [{
+        title: "Toggle visibility",
+        value: "visible"
+      }, {
+        title: hasHeader(id) ? "Remove layout heading" : "Add layout heading",
+        value: "header"
+      }, {
+        title: "Move up",
+        value: "up"
+      }, {
+        title: "Move down",
+        value: "down"
+      }, {
+        title: "Toggle collapsed",
+        value: "collapsed"
+      }, {
+        title: "Set colour",
+        value: "color"
+      }, {
+        title: "Rename",
+        value: "title"
+      }, {
+        title: "Open plugin settings",
+        value: "settings"
+      }];
+      for (;;) {
+        const action = await context.ui.dialog.select({
+          get title() {
+            return `Configure ${labelFor(id)}`;
+          },
+          get current() {
+            return sticky;
+          },
+          get options() {
+            return actionOptions();
+          },
+          get actions() {
+            return [{
+              bind: "alt+up",
+              title: "Move up",
+              selection: "none",
+              onTrigger: () => reorder(id, -1)
+            }, {
+              bind: "alt+down",
+              title: "Move down",
+              selection: "none",
+              onTrigger: () => reorder(id, 1)
+            }];
+          }
+        });
+        if (!action) return true;
+        if (action === "up" || action === "down") {
+          sticky = action;
+          reorder(id, action === "up" ? -1 : 1);
+          continue;
+        }
+        if (action === "settings") {
+          await openPluginSettings(id);
+          return false;
+        }
+        if (action === "title") {
+          const title = await context.ui.dialog.prompt({
+            title: "Section title",
+            value: labelFor(id)
+          });
+          if (title !== undefined) setSection(id, {
+            title: title || id
+          });
+          return false;
+        }
+        if (action === "color") {
+          const choice = await context.ui.dialog.select({
+            title: "Colour",
+            options: COLORS.map(c => ({
+              title: c,
+              value: c
+            }))
+          });
+          if (choice) setSection(id, {
+            color: choice
+          });
+          return false;
+        }
+        if (action === "visible") {
+          setSection(id, {
+            visible: !isVisible(id)
+          });
+          return false;
+        }
+        if (action === "header") {
+          setSection(id, {
+            header: !hasHeader(id)
+          });
+          return false;
+        }
+        if (action === "collapsed") {
+          setSection(id, {
+            collapsed: !isCollapsed(id)
+          });
+          return false;
+        }
+        return false;
+      }
+    }
     async function configure() {
-      const ids = orderedIds();
-      if (!ids.length) {
+      if (!orderedIds().length) {
         await context.ui.dialog.alert({
           title: "Sidebar layout",
           message: "No adopted sidebar sections detected. Open a session so the sidebar mounts, or set includeBuiltin in sidebar-layout.json to manage the host's own sections."
         });
         return;
       }
-      const pick = await context.ui.dialog.select({
-        title: "Sidebar section",
-        options: ids.map(id => ({
-          title: `${isVisible(id) ? "shown" : "hidden"} · ${hasHeader(id) ? isCollapsed(id) ? "collapsed" : "expanded" : "no heading"} · ${labelFor(id)}`,
-          value: id
-        }))
-      });
-      if (!pick) return;
-      const action = await context.ui.dialog.select({
-        title: `Configure ${labelFor(pick)}`,
-        options: [{
-          title: "Toggle visibility",
-          value: "visible"
-        }, {
-          title: hasHeader(pick) ? "Remove layout heading" : "Add layout heading",
-          value: "header"
-        }, {
-          title: "Move up",
-          value: "up"
-        }, {
-          title: "Move down",
-          value: "down"
-        }, {
-          title: "Toggle collapsed",
-          value: "collapsed"
-        }, {
-          title: "Set colour",
-          value: "color"
-        }, {
-          title: "Rename",
-          value: "title"
-        }, {
-          title: "Open plugin settings",
-          value: "settings"
-        }]
-      });
-      if (!action) return;
-      if (action === "settings") return openPluginSettings(pick);
-      if (action === "visible") return setSection(pick, {
-        visible: !isVisible(pick)
-      });
-      if (action === "header") return setSection(pick, {
-        header: !hasHeader(pick)
-      });
-      if (action === "collapsed") return setSection(pick, {
-        collapsed: !isCollapsed(pick)
-      });
-      if (action === "up" || action === "down") return reorder(pick, action === "up" ? -1 : 1);
-      if (action === "title") {
-        const title = await context.ui.dialog.prompt({
-          title: "Section title",
-          value: labelFor(pick)
+      const sectionOptions = () => orderedIds().map(id => ({
+        title: `${isVisible(id) ? "shown" : "hidden"} · ${hasHeader(id) ? isCollapsed(id) ? "collapsed" : "expanded" : "no heading"} · ${labelFor(id)}`,
+        value: id
+      }));
+      for (;;) {
+        const pick = await context.ui.dialog.select({
+          title: "Sidebar section",
+          get options() {
+            return sectionOptions();
+          }
         });
-        if (title !== undefined) setSection(pick, {
-          title: title || pick
-        });
-        return;
-      }
-      if (action === "color") {
-        const choice = await context.ui.dialog.select({
-          title: "Colour",
-          options: COLORS.map(c => ({
-            title: c,
-            value: c
-          }))
-        });
-        if (choice) setSection(pick, {
-          color: choice
-        });
+        if (!pick) return;
+        if (!(await configureSection(pick))) return;
       }
     }
 
