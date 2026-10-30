@@ -15,7 +15,16 @@ import { TextAttributes } from "@opentui/core";
 const SIDEBAR_SLOT = "sidebar.content";
 const PLUGIN_ID = "sidebar.layout";
 const COLORS = ["base", "muted", "success", "warning", "error", "info"];
+// Fallback only. The host marks its own bundled sections with
+// `source: "builtin"` in its plugin registry, and that is the reliable signal:
+// a third-party plugin is free to publish under the `opencode.` namespace (for
+// example the `opencode-filebrowser` package declares the id
+// `opencode.filebrowser.tui`), so the id prefix alone misclassifies it as a
+// host built-in. The prefix is used only when the registry is unreachable.
 const BUILTIN = /^opencode[./]/;
+// Id segments that name the surface a plugin attaches to rather than the
+// plugin itself, skipped when deriving a friendly heading.
+const ID_QUALIFIERS = new Set(["tui", "cli", "ui", "gui", "plugin", "sidebar"]);
 const ACRONYMS: Record<string, string> = {
   mcp: "MCP",
   ai: "AI",
@@ -40,6 +49,9 @@ interface SectionConfig {
   collapsed?: boolean;
   color?: string;
   title?: string;
+  // Per-section override of the built-in / third-party default. `true` adopts
+  // a host built-in; `false` leaves a third-party section unmanaged.
+  managed?: boolean;
 }
 
 // The host keeps every plugin's slot claims in a Solid context that it provides
@@ -114,22 +126,36 @@ function shortenVersion(value: string) {
     : value;
 }
 
-function isBuiltin(id: string) {
+// Whether an adopted section is one of the host's own bundled sections. Prefer
+// the host registry's `source: "builtin"` marker; fall back to the id prefix
+// only when the registry is unavailable.
+export function classifyBuiltin(
+  id: string,
+  builtinIds?: ReadonlySet<string>,
+): boolean {
+  if (builtinIds && builtinIds.size) return builtinIds.has(String(id));
   return BUILTIN.test(String(id));
 }
 
 // Friendly default heading for an adopted plugin, so the sidebar does not show
-// raw reverse-DNS ids such as "opencode.sidebar.mcp".
-function defaultTitle(id: string) {
+// raw reverse-DNS ids such as "opencode.sidebar.mcp". Trailing surface
+// qualifiers (`.tui`, `.cli`, `-tui`, …) are ignored so `pr-dashboard.tui`
+// reads as "Pr Dashboard" rather than "Tui".
+export function defaultTitle(id: string) {
   const tail = String(id)
-    .replace(/^opencode[./]/, "")
+    .replace(/^opencode[./-]/, "")
     .replace(/^sidebar[./]/, "")
     .replace(/^plugin[./]/, "");
-  const last = tail.split(/[./]/).filter(Boolean).pop() ?? String(id);
+  const segments = tail.split(/[./]/).filter(Boolean);
+  const meaningful = segments.filter(
+    (segment) => !ID_QUALIFIERS.has(segment.toLowerCase()),
+  );
+  const chosen =
+    (meaningful.length ? meaningful : segments).pop() ?? String(id);
+  const words = chosen.split(/[-_]/).filter(Boolean);
+  const named = words.filter((word) => !ID_QUALIFIERS.has(word.toLowerCase()));
   return (
-    last
-      .split(/[-_]/)
-      .filter(Boolean)
+    (named.length ? named : words)
       .map(
         (word) =>
           ACRONYMS[word.toLowerCase()] ??
@@ -247,6 +273,8 @@ export default Plugin.define({
     const defaults = {
       mode: "adopt",
       includeBuiltin: false,
+      // Host built-in ids to adopt individually, without the blanket switch.
+      manageIds: [] as string[],
       collapseByDefault: context.options?.collapsedByDefault !== false,
       dragReorder: true,
       sections: {} as Record<string, SectionConfig>,
@@ -278,6 +306,24 @@ export default Plugin.define({
     };
 
     const [detected, setDetected] = createSignal<string[]>([]);
+    // The host context is only reachable from inside the Solid owner tree, but
+    // the configure command and the ordering helpers run outside it. Capture the
+    // host once the probe mounts so built-in classification survives.
+    const [host, setHost] = createSignal<any>(undefined);
+    // Host sections the host itself marks as bundled. Empty until the probe
+    // mounts (or when the registry is unavailable), which makes classifyBuiltin
+    // fall back to the id prefix.
+    const hostBuiltins = createMemo(() => {
+      const ids = new Set<string>();
+      try {
+        for (const plugin of host()?.registered?.() ?? []) {
+          if (plugin?.source === "builtin" && plugin?.id) {
+            ids.add(String(plugin.id));
+          }
+        }
+      } catch {}
+      return ids as ReadonlySet<string>;
+    });
 
     // Best-effort version/source label per plugin, from the server inventory
     // first and the local TUI plugin list second.
@@ -320,9 +366,24 @@ export default Plugin.define({
       config()?.sections?.[id] ?? {};
     const collapseDefault = () => config()?.collapseByDefault !== false;
     const includeBuiltin = () => config()?.includeBuiltin === true;
+    const manageIds = () =>
+      new Set(
+        (Array.isArray(config()?.manageIds) ? config().manageIds : []).map(
+          (id: any) => String(id),
+        ),
+      );
     // Built-ins pass through untouched by default; third-party plugins are
-    // always managed. Setting includeBuiltin adopts the host's own sections too.
-    const isManaged = (id: string) => includeBuiltin() || !isBuiltin(id);
+    // always managed. A section can override either way with `managed`, and
+    // `manageIds` adopts individual host sections without adopting them all.
+    // Built-in detection prefers the host registry's own classification and
+    // falls back to the id prefix only when the registry is unavailable.
+    const isManaged = (id: string) => {
+      const override = section(id).managed;
+      if (typeof override === "boolean") return override;
+      if (includeBuiltin()) return true;
+      if (manageIds().has(id)) return true;
+      return !classifyBuiltin(id, hostBuiltins());
+    };
     // No layout-drawn heading by default: every known sidebar plugin already
     // renders its own heading, so drawing a second one would duplicate it. This
     // also keeps the default safe for third-party plugins the layout has never
@@ -701,7 +762,7 @@ export default Plugin.define({
         await context.ui.dialog.alert({
           title: "Sidebar layout",
           message:
-            "No adopted sidebar sections detected. Open a session so the sidebar mounts, or set includeBuiltin in sidebar-layout.json to manage the host's own sections.",
+            "No adopted sidebar sections detected. Open a session so the sidebar mounts, or set includeBuiltin (all host sections) or manageIds (listed host sections) in sidebar-layout.json.",
         });
         return;
       }
@@ -742,7 +803,9 @@ export default Plugin.define({
 
     function upgrade() {
       if (upgraded) return;
-      if (!hostFromOwner()) return;
+      const currentHost = hostFromOwner();
+      if (!currentHost) return;
+      setHost(currentHost);
       upgraded = true;
       try {
         dispose?.();

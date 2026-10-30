@@ -42,8 +42,23 @@ from the previous one by a single blank line.
 The single `replace` claim necessarily displaces the host's own sidebar sections
 (session context, limits, MCP servers, todos) as well as third-party ones. By
 default those host sections are re-rendered unchanged — no heading, always
-visible — so the built-in sidebar looks the same. Set `includeBuiltin` to `true`
-to adopt the host sections into the same heading/order/visibility model.
+visible — so the built-in sidebar looks the same.
+
+A section is treated as a host built-in only when the host's own plugin registry
+marks it `source: "builtin"`. The plugin id prefix is deliberately **not** used
+to decide this: a third-party plugin is free to publish under the `opencode.`
+namespace (for example the `opencode-filebrowser` package declares the section id
+`opencode.filebrowser.tui`), and an id-prefix rule would strand it at the bottom
+of the sidebar, unmanaged. The prefix is used only as a fallback when the
+registry is unavailable.
+
+To adopt host sections into the same heading/order/visibility model:
+
+- `"includeBuiltin": true` adopts **all** host sections.
+- `"manageIds": ["opencode.sidebar.mcp"]` adopts only the listed host sections,
+  leaving the rest as pass-through.
+- Per-section `"managed": true | false` overrides the default for one id either
+  way (adopt one built-in, or leave one third-party section unmanaged).
 
 ## Configuration
 
@@ -57,6 +72,8 @@ Settings live in `~/.config/opencode/sidebar-layout.json` and are edited with th
   "mode": "adopt",
   // Also adopt the host's own sidebar sections (default: false, they pass through).
   "includeBuiltin": false,
+  // Adopt only these host-built-in ids, without the blanket switch above.
+  "manageIds": ["opencode.sidebar.mcp"],
   // New sections start collapsed unless a section overrides it.
   "collapseByDefault": true,
   // Drag a section by its heading, or Ctrl + drag anywhere, to reorder it
@@ -67,6 +84,12 @@ Settings live in `~/.config/opencode/sidebar-layout.json` and are edited with th
     "plugins.pane": {
       "order": 0,
       "visible": true,
+    },
+    "opencode.sidebar.mcp": {
+      // Per-section override of the built-in default; true adopting a host
+      // built-in is equivalent to listing the id under manageIds.
+      "managed": true,
+      "order": 4,
     },
     "timezone.clocks": {
       "order": 1,
@@ -83,6 +106,10 @@ Settings live in `~/.config/opencode/sidebar-layout.json` and are edited with th
 
 - `order` — lower sorts first among managed sections; unset keeps registration order.
 - `visible` — set `false` to hide a section entirely.
+- `managed` — per-section override of whether the section is managed. A host
+  built-in defaults to unmanaged; a third-party section defaults to managed.
+  Set `true` to adopt one host built-in (equivalent to listing its id in
+  `manageIds`), or `false` to leave one third-party section as pass-through.
 - `header` — set `true` to have the layout draw its own collapsible heading
   instead of relying on the plugin's. Defaults to `false`, because every known
   sidebar plugin already draws its own heading; the default is also safe for
